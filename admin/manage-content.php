@@ -2,6 +2,10 @@
 include 'includes/header.php';
 require_once __DIR__ . '/../includes/db.php';
 
+function is_image_content_key($key) {
+    return strpos($key, 'image') !== false;
+}
+
 // Handle addition
 if (isset($_POST['add_string'])) {
     $page = $_POST['page'];
@@ -21,12 +25,77 @@ if (isset($_POST['add_string'])) {
 if (isset($_POST['bulk_update'])) {
     $updates = $_POST['content'] ?? [];
     $count = 0;
+    $upload_errors = [];
+
+    $rows = $pdo->query("SELECT id, content_key, content_value FROM content")->fetchAll();
+    $content_map = [];
+    foreach ($rows as $row) {
+        $content_map[(int)$row['id']] = $row;
+    }
+
+    $upload_dir_fs = __DIR__ . '/../uploads/content';
+    $upload_dir_web = 'uploads/content';
+    if (!is_dir($upload_dir_fs)) {
+        mkdir($upload_dir_fs, 0755, true);
+    }
+
     foreach ($updates as $id => $value) {
+        $id = (int)$id;
+        $value_to_save = trim((string)$value);
+
+        if (isset($content_map[$id]) && is_image_content_key($content_map[$id]['content_key']) && isset($_FILES['content_file']['error'][$id])) {
+            $file_error = (int)$_FILES['content_file']['error'][$id];
+
+            if ($file_error !== UPLOAD_ERR_NO_FILE) {
+                if ($file_error === UPLOAD_ERR_OK) {
+                    $tmp_name = $_FILES['content_file']['tmp_name'][$id];
+                    $original_name = $_FILES['content_file']['name'][$id];
+                    $size = (int)$_FILES['content_file']['size'][$id];
+
+                    $ext = strtolower(pathinfo($original_name, PATHINFO_EXTENSION));
+                    $allowed_ext = ['jpg', 'jpeg', 'png', 'webp', 'gif'];
+
+                    $finfo = finfo_open(FILEINFO_MIME_TYPE);
+                    $mime = $finfo ? finfo_file($finfo, $tmp_name) : '';
+                    if ($finfo) {
+                        finfo_close($finfo);
+                    }
+                    $allowed_mime = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+
+                    if (!in_array($ext, $allowed_ext, true) || !in_array($mime, $allowed_mime, true)) {
+                        $upload_errors[] = "Invalid image file for key: " . $content_map[$id]['content_key'];
+                    } elseif ($size > 5 * 1024 * 1024) {
+                        $upload_errors[] = "Image too large (max 5MB) for key: " . $content_map[$id]['content_key'];
+                    } else {
+                        $safe_base = preg_replace('/[^a-zA-Z0-9_-]/', '-', pathinfo($original_name, PATHINFO_FILENAME));
+                        $safe_base = trim($safe_base, '-');
+                        if ($safe_base === '') {
+                            $safe_base = 'image';
+                        }
+
+                        $file_name = $content_map[$id]['content_key'] . '-' . $safe_base . '-' . time() . '.' . $ext;
+                        $target_fs = $upload_dir_fs . '/' . $file_name;
+
+                        if (move_uploaded_file($tmp_name, $target_fs)) {
+                            $value_to_save = $upload_dir_web . '/' . $file_name;
+                        } else {
+                            $upload_errors[] = "Failed to save uploaded file for key: " . $content_map[$id]['content_key'];
+                        }
+                    }
+                } else {
+                    $upload_errors[] = "Upload failed for key: " . $content_map[$id]['content_key'];
+                }
+            }
+        }
+
         $stmt = $pdo->prepare("UPDATE content SET content_value = ? WHERE id = ?");
-        $stmt->execute([$value, (int)$id]);
+        $stmt->execute([$value_to_save, $id]);
         $count++;
     }
     $success = "$count content fields updated successfully!";
+    if (!empty($upload_errors)) {
+        $error = implode(' | ', $upload_errors);
+    }
 }
 
 // Handle deletion
@@ -117,7 +186,7 @@ $page_labels = [
         <h3 class="text-lg font-bold text-slate-900"><?php echo $page_labels[$page_filter] ?? ucfirst(h($page_filter)); ?></h3>
         <span class="text-sm text-slate-500"><?php echo count($strings); ?> fields</span>
     </div>
-    <form method="POST" class="space-y-5">
+    <form method="POST" enctype="multipart/form-data" class="space-y-5">
         <?php foreach ($strings as $row): ?>
         <div class="group">
             <div class="flex items-center justify-between mb-1.5">
@@ -137,6 +206,18 @@ $page_labels = [
             <?php else: ?>
                 <input type="text" name="content[<?php echo $row['id']; ?>]" value="<?php echo h($row['content_value']); ?>" 
                     class="w-full bg-white border border-slate-200 rounded-xl px-4 py-3 text-slate-900 focus:outline-none focus:ring-2 focus:ring-green-500/30 focus:border-green-500 transition">
+            <?php endif; ?>
+
+            <?php if (is_image_content_key($row['content_key'])): ?>
+                <div class="mt-2 p-3 rounded-lg border border-dashed border-slate-300 bg-slate-50">
+                    <label class="block text-xs font-semibold text-slate-500 mb-2 uppercase tracking-wider">Upload Image (optional)</label>
+                    <input type="file" name="content_file[<?php echo $row['id']; ?>]" accept="image/*"
+                        class="w-full text-sm text-slate-700 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border-0 file:bg-green-100 file:text-green-700 file:font-semibold hover:file:bg-green-200">
+                    <p class="text-xs text-slate-400 mt-2">Accepted: JPG, PNG, WEBP, GIF (max 5MB). Uploaded image path will replace text value.</p>
+                    <?php if (!empty($row['content_value']) && is_image_content_key($row['content_key'])): ?>
+                        <p class="text-xs text-slate-500 mt-2">Current: <?php echo h($row['content_value']); ?></p>
+                    <?php endif; ?>
+                </div>
             <?php endif; ?>
         </div>
         <?php endforeach; ?>
